@@ -180,14 +180,14 @@ def _handle_message(sid: str, msg: dict) -> Optional[dict]:
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
 
-        # Log the Authorization header so we can confirm whether Joule forwards
-        # the user's JWT (needed for PrincipalPropagation user identity forwarding)
-        _auth_header = request.headers.get("Authorization", "")
-        if _auth_header:
-            _auth_preview = _auth_header[:40] + "..." if len(_auth_header) > 40 else _auth_header
-            logger.info("tools/call auth header present: %s", _auth_preview)
-        else:
-            logger.info("tools/call auth header: NOT present")
+        # Log all incoming headers to find any user identity token Joule may send
+        _interesting = {
+            k: (v[:60] + "..." if len(v) > 60 else v)
+            for k, v in request.headers
+            if k.lower() not in ("host", "content-length", "content-type",
+                                  "accept-encoding", "connection", "user-agent")
+        }
+        logger.info("tools/call incoming headers: %s", _interesting)
 
         if tool_name not in TOOLS_BY_NAME:
             return _err(req_id, -32602, f"Unknown tool: {tool_name}")
