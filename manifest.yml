@@ -1,0 +1,55 @@
+---
+# ============================================================
+# SAP Product Master MCP Server - Cloud Foundry Manifest
+# ============================================================
+# Deploy to SAP BTP Cloud Foundry:
+#   cf login -a https://api.cf.<region>.hana.ondemand.com
+#   cf push
+#
+# Switching environments:
+#   Local dev  → cp .env.local .env   (uses S4_* direct connection)
+#   BTP / prod → cp .env.prod .env    (uses DESTINATION_* service)
+
+applications:
+  - name: sap-product-mcp-server
+    memory: 256M
+    disk_quota: 512M
+    instances: 1
+    # Assigns a unique random route (e.g. sap-product-mcp-server-<adjective-noun>.<cf-apps-domain>)
+    # The app NAME stays "sap-product-mcp-server" regardless — cf set-env / cf start / cf logs
+    # all target the app by name, not by route.
+    # Run 'cf app sap-product-mcp-server' after deployment to see the assigned URL.
+    random-route: true
+    buildpacks:
+      - python_buildpack
+    command: python app.py
+
+    # Cloud Foundry injects PORT=8080 automatically; app.py reads it via os.getenv("PORT","5001")
+    health-check-type: http
+    health-check-http-endpoint: /health
+
+    # Bind the Destination service instance (created in BTP Cockpit > Instances and Subscriptions)
+    # Replace the value below with the actual name of your Destination service instance
+    services:
+      - Hackathon-destination
+
+    env:
+      # Name of the destination entry configured in BTP Cockpit > Connectivity > Destinations
+      # Must point to your S/4HANA system with API_PRODUCT_SRV
+      DESTINATION_NAME: S4HANA_PRODUCT_SRV
+
+      # Destination service OAuth2 credentials (from the service binding in BTP Cockpit)
+      # BTP Cockpit > Instances and Subscriptions > <your Destination instance> > Bindings > View credentials
+      #
+      # Set these via 'cf set-env' to avoid storing secrets in this file:
+      #   cf set-env sap-product-mcp-server DESTINATION_SERVICE_AUTH_URL   "https://..."
+      #   cf set-env sap-product-mcp-server DESTINATION_SERVICE_CLIENT_ID  "sb-clone-..."
+      #   cf set-env sap-product-mcp-server DESTINATION_SERVICE_CLIENT_SECRET "..."
+      #   cf set-env sap-product-mcp-server DESTINATION_SERVICE_URL        "https://destination-configuration.cfapps.<region>.hana.ondemand.com"
+      #   cf restage sap-product-mcp-server
+      #
+      # Or fill in the values directly here (not recommended for secrets):
+      # DESTINATION_SERVICE_AUTH_URL: https://<subdomain>.authentication.<region>.hana.ondemand.com/oauth/token
+      # DESTINATION_SERVICE_CLIENT_ID: sb-clone-<uuid>!b<number>
+      # DESTINATION_SERVICE_CLIENT_SECRET: <secret>
+      # DESTINATION_SERVICE_URL: https://destination-configuration.cfapps.<region>.hana.ondemand.com
