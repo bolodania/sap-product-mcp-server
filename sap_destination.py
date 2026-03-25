@@ -5,8 +5,18 @@ Handles:
 1. Fetching XSUAA OAuth2 token for the Destination service
 2. Retrieving destination details from SAP BTP Destination service
 3. Making authenticated HTTP calls to S/4HANA via the destination
+
+Credential resolution order
+---------------------------
+1. VCAP_SERVICES (automatic when the Destination service is bound to the CF app)
+   Only DESTINATION_NAME still needs to be set as an env var.
+
+2. DESTINATION_SERVICE_* environment variables (local dev / manual override)
+
+3. S4_BASE_URL / S4_USERNAME / S4_PASSWORD (direct connection, local dev only)
 """
 
+import json
 import os
 import logging
 import time
@@ -18,6 +28,50 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# VCAP_SERVICES helper
+# ---------------------------------------------------------------------------
+
+def _read_vcap_destination() -> Optional[Dict[str, Any]]:
+    """
+    Parse VCAP_SERVICES and return the credentials block of the first
+    bound 'destination' service instance, or None if not present.
+
+    CF injects VCAP_SERVICES automatically when a service is bound.
+    The relevant keys inside credentials are:
+      clientid     – OAuth2 client ID
+      clientsecret – OAuth2 client secret
+      uri          – Destination service REST API base URL
+      url          – XSUAA base URL
+                     (token URL = url + "/oauth/token")
+    """
+    vcap_raw = os.getenv("VCAP_SERVICES", "")
+    if not vcap_raw:
+        return None
+    try:
+        vcap = json.loads(vcap_raw)
+    except json.JSONDecodeError:
+        logger.warning("VCAP_SERVICES is set but could not be parsed as JSON")
+        return None
+
+    # The service label is "destination" in the CF marketplace.
+    for key in ("destination",):
+        instances = vcap.get(key, [])
+        if instances:
+            creds = instances[0].get("credentials", {})
+            if creds.get("clientid") and creds.get("uri"):
+                logger.debug(
+                    "Found Destination service credentials in VCAP_SERVICES[%s]", key
+                )
+                return creds
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Token cache
+# ---------------------------------------------------------------------------
 
 class TokenCache:
     """Simple in-memory token cache with expiry."""
@@ -36,52 +90,87 @@ class TokenCache:
         self._expires_at = time.time() + expires_in
 
 
+# ---------------------------------------------------------------------------
+# Main client
+# ---------------------------------------------------------------------------
+
 class SAPDestinationClient:
     """
     Client for SAP BTP Destination Service.
 
-    Reads connection details from environment variables:
+    Credential resolution order:
 
-    BTP Destination Service mode (recommended):
-      DESTINATION_SERVICE_AUTH_URL      XSUAA token URL for Destination service
-                                        e.g. https://<subdomain>.authentication.<region>.hana.ondemand.com/oauth/token
-      DESTINATION_SERVICE_CLIENT_ID     OAuth2 client ID (from Destination service binding)
-      DESTINATION_SERVICE_CLIENT_SECRET OAuth2 client secret
-      DESTINATION_SERVICE_URL           Destination service REST API base URL
-                                        e.g. https://destination-configuration.cfapps.<region>.hana.ondemand.com
-      DESTINATION_NAME                  Name of the destination configured in BTP cockpit
+    1. VCAP_SERVICES  (automatic when Destination service is bound to the CF app)
+       Only DESTINATION_NAME still needs to be set as an env var.
 
-    Direct connection mode (for local development / testing):
-      S4_BASE_URL                       Direct S/4HANA base URL (e.g. https://my-s4.example.com)
-      S4_USERNAME                       Basic auth username
-      S4_PASSWORD                       Basic auth password
+    2. Manual env vars  (local development / CI):
+         DESTINATION_SERVICE_AUTH_URL      XSUAA token URL
+         DESTINATION_SERVICE_CLIENT_ID     OAuth2 client ID
+         DESTINATION_SERVICE_CLIENT_SECRET OAuth2 client secret
+         DESTINATION_SERVICE_URL           Destination service REST API base URL
+         DESTINATION_NAME                  Destination name in BTP cockpit
+
+    3. Direct S/4HANA connection  (local dev / testing without BTP):
+         S4_BASE_URL    Direct S/4HANA base URL
+         S4_USERNAME    Basic auth username
+         S4_PASSWORD    Basic auth password
     """
 
     S4_ODATA_BASE = "/sap/opu/odata/sap/API_PRODUCT_SRV"
 
     def __init__(self):
-        # Destination service credentials
-        self.dest_auth_url = os.getenv("DESTINATION_SERVICE_AUTH_URL", "")
-        self.dest_client_id = os.getenv("DESTINATION_SERVICE_CLIENT_ID", "")
-        self.dest_client_secret = os.getenv("DESTINATION_SERVICE_CLIENT_SECRET", "")
-        self.dest_service_url = os.getenv("DESTINATION_SERVICE_URL", "")
         self.destination_name = os.getenv("DESTINATION_NAME", "")
 
-        # Direct connection fallback
+        # ------------------------------------------------------------------
+        # Priority 1: VCAP_SERVICES (CF bound service)
+        # ------------------------------------------------------------------
+        vcap_creds = _read_vcap_destination()
+        if vcap_creds and self.destination_name:
+            # VCAP "url" is the XSUAA base URL; append /oauth/token for the
+            # token endpoint.  Some bindings already include the full path.
+            xsuaa_base = vcap_creds.get("url", "").rstrip("/")
+            if not xsuaa_base.endswith("/oauth/token"):
+                xsuaa_base = xsuaa_base + "/oauth/token"
+
+            self.dest_auth_url = xsuaa_base
+            self.dest_client_id = vcap_creds.get("clientid", "")
+            self.dest_client_secret = vcap_creds.get("clientsecret", "")
+            self.dest_service_url = vcap_creds.get("uri", "").rstrip("/")
+            logger.info(
+                "Destination service credentials loaded from VCAP_SERVICES "
+                "(destination: %s)", self.destination_name
+            )
+
+        # ------------------------------------------------------------------
+        # Priority 2: manual DESTINATION_SERVICE_* env vars
+        # ------------------------------------------------------------------
+        else:
+            self.dest_auth_url = os.getenv("DESTINATION_SERVICE_AUTH_URL", "")
+            self.dest_client_id = os.getenv("DESTINATION_SERVICE_CLIENT_ID", "")
+            self.dest_client_secret = os.getenv("DESTINATION_SERVICE_CLIENT_SECRET", "")
+            self.dest_service_url = os.getenv("DESTINATION_SERVICE_URL", "")
+            if self.dest_auth_url:
+                logger.info(
+                    "Destination service credentials loaded from env vars "
+                    "(destination: %s)", self.destination_name
+                )
+
+        # ------------------------------------------------------------------
+        # Priority 3: direct S/4HANA connection
+        # ------------------------------------------------------------------
         self.s4_base_url = os.getenv("S4_BASE_URL", "")
         self.s4_username = os.getenv("S4_USERNAME", "")
         self.s4_password = os.getenv("S4_PASSWORD", "")
 
-        # Token caches
+        # Token cache
         self._dest_token_cache = TokenCache()
-        self._s4_token_cache = TokenCache()
 
         # Cached destination details
         self._destination_details: Optional[Dict[str, Any]] = None
         self._destination_cached_at: float = 0.0
         self._destination_cache_ttl: int = 300  # 5 minutes
 
-        # Determine mode
+        # Determine active mode
         self.use_destination_service = bool(
             self.dest_auth_url
             and self.dest_client_id
@@ -91,14 +180,20 @@ class SAPDestinationClient:
         )
 
         if self.use_destination_service:
-            logger.info("SAP client configured with BTP Destination Service (destination: %s)", self.destination_name)
+            logger.info(
+                "SAP client mode: BTP Destination Service (destination: %s)",
+                self.destination_name,
+            )
         elif self.s4_base_url:
-            logger.info("SAP client configured with direct S/4HANA connection (%s)", self.s4_base_url)
+            logger.info(
+                "SAP client mode: direct S/4HANA connection (%s)", self.s4_base_url
+            )
         else:
             logger.warning(
                 "SAP client: no connection configured. "
-                "Set DESTINATION_* env vars for BTP Destination Service, "
-                "or S4_BASE_URL / S4_USERNAME / S4_PASSWORD for direct connection."
+                "Bind the Destination service to this app and set DESTINATION_NAME, "
+                "or set DESTINATION_SERVICE_* env vars, "
+                "or set S4_BASE_URL / S4_USERNAME / S4_PASSWORD for a direct connection."
             )
 
     # ------------------------------------------------------------------
@@ -139,7 +234,10 @@ class SAPDestinationClient:
             return self._destination_details
 
         token = self._get_destination_service_token()
-        url = f"{self.dest_service_url.rstrip('/')}/destination-configuration/v1/destinations/{self.destination_name}"
+        url = (
+            f"{self.dest_service_url}/destination-configuration/v1"
+            f"/destinations/{self.destination_name}"
+        )
         logger.debug("Fetching destination details from %s", url)
 
         resp = requests.get(
@@ -181,7 +279,9 @@ class SAPDestinationClient:
                     token_value = token_entry.get("value", "")
                     session.headers["Authorization"] = f"{token_type} {token_value}"
                 else:
-                    logger.warning("No authTokens found in destination response for OAuth2 destination")
+                    logger.warning(
+                        "No authTokens found in destination response for OAuth2 destination"
+                    )
 
             elif auth_type == "NoAuthentication":
                 pass  # No auth needed
@@ -189,7 +289,7 @@ class SAPDestinationClient:
             else:
                 logger.warning("Unsupported destination auth type: %s", auth_type)
 
-            # Additional headers from destination
+            # Additional headers from destination (URL.headers.*)
             for key, value in dest_config.items():
                 if key.startswith("URL.headers."):
                     header_name = key[len("URL.headers."):]
@@ -227,7 +327,9 @@ class SAPDestinationClient:
         if not self.use_destination_service and not self.s4_base_url:
             raise RuntimeError(
                 "No SAP connection configured. "
-                "Set DESTINATION_* env vars or S4_BASE_URL / S4_USERNAME / S4_PASSWORD."
+                "Bind the Destination service to this app and set DESTINATION_NAME, "
+                "or set DESTINATION_SERVICE_* env vars, "
+                "or set S4_BASE_URL / S4_USERNAME / S4_PASSWORD."
             )
 
         base_url, session = self._build_s4_session()

@@ -81,9 +81,30 @@ The server starts on `http://0.0.0.0:5001` by default.
 
 ## Configuration
 
-### Option A – SAP BTP Destination Service (recommended)
+The server resolves credentials in this order:
 
-Set the following variables in `.env` (values from your BTP Destination service binding):
+| Priority | Source | When to use |
+|---|---|---|
+| 1 | **`VCAP_SERVICES`** (auto-injected by CF) | App is deployed on CF with Destination service **bound** |
+| 2 | **`DESTINATION_SERVICE_*` env vars** | Local dev, CI, or manual override |
+| 3 | **`S4_BASE_URL` / `S4_*` env vars** | Local dev without BTP |
+
+### Option A – CF deployment with bound Destination service (recommended)
+
+When the Destination service instance is **bound** to the CF app (via `manifest.yml`
+or `cf bind-service`), CF automatically injects its credentials into `VCAP_SERVICES`.
+The app reads them at startup — **no manual credential env vars needed**.
+
+The only variable you must set is:
+
+| Variable | Description |
+|---|---|
+| `DESTINATION_NAME` | Name of the destination entry in BTP Cockpit → Connectivity → Destinations |
+
+### Option B – Manual env vars (local dev / CI)
+
+Use this when running outside CF or when you want to override the bound service.
+Set the following variables in `.env`:
 
 | Variable | Description |
 |---|---|
@@ -96,7 +117,7 @@ Set the following variables in `.env` (values from your BTP Destination service 
 The destination in BTP Cockpit should point to your S/4HANA system and be
 configured with the appropriate authentication (BasicAuthentication or OAuth2).
 
-### Option B – Direct S/4HANA connection (local dev / testing)
+### Option C – Direct S/4HANA connection (local dev / testing)
 
 Set these variables instead of the Destination service ones:
 
@@ -286,30 +307,18 @@ cf push --no-start
 This uploads the files and creates the app in CF (so `cf set-env` can target it),
 but does **not** start it yet — avoiding a failed start due to missing credentials.
 
-### 4. Set Destination service credentials
+### 4. Set the destination name
 
-Retrieve the credentials from:
-**BTP Cockpit → Instances and Subscriptions → your Destination instance → Bindings → View credentials**
-
-Set them as CF environment variables (keeps secrets out of `manifest.yml`).
-
-> **zsh note:** The client ID and secret contain `!` which zsh's `BANG_HIST`
-> expands even inside single quotes. Disable it for this block, then restore:
+The only env var you need to set manually is the name of the destination entry
+in BTP Cockpit. The Destination service credentials are read automatically from
+`VCAP_SERVICES` once the service is bound (step 2 of the manifest).
 
 ```bash
-setopt nobanghist   # disable ! history expansion
-
-cf set-env sap-product-mcp-server DESTINATION_SERVICE_AUTH_URL \
-  'https://<subdomain>.authentication.<region>.hana.ondemand.com/oauth/token'
-cf set-env sap-product-mcp-server DESTINATION_SERVICE_CLIENT_ID \
-  'sb-clone-<uuid>!b<number>|destination-xsappname!b<number>'
-cf set-env sap-product-mcp-server DESTINATION_SERVICE_CLIENT_SECRET \
-  '<secret>'
-cf set-env sap-product-mcp-server DESTINATION_SERVICE_URL \
-  'https://destination-configuration.cfapps.<region>.hana.ondemand.com'
-
-setopt banghist     # restore ! history expansion
+cf set-env sap-product-mcp-server DESTINATION_NAME S4HANA_PRODUCT_SRV
 ```
+
+Replace `S4HANA_PRODUCT_SRV` with the actual destination name you configured in
+BTP Cockpit → Connectivity → Destinations.
 
 ### 5. Start the app
 
@@ -373,8 +382,9 @@ Expected response:
 | BTP / CF deployment | `cf push` (uses `manifest.yml` + `cf set-env`) | Option A – Destination Service |
 
 The server selects the mode automatically:
-- All five `DESTINATION_*` vars present → **Option A** (BTP Destination Service)
-- Any `DESTINATION_*` var missing or empty → **Option B** (direct `S4_BASE_URL`)
+- `VCAP_SERVICES` present **and** `DESTINATION_NAME` set → **Option A** (bound CF service, credentials from VCAP)
+- `DESTINATION_SERVICE_*` env vars present → **Option B** (manual env vars)
+- Neither of the above → **Option C** (direct `S4_BASE_URL`)
 
 ---
 
