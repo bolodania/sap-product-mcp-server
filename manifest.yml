@@ -28,10 +28,14 @@ applications:
     health-check-type: http
     health-check-http-endpoint: /health
 
-    # Bind the Destination service instance (created in BTP Cockpit > Instances and Subscriptions)
-    # Replace the value below with the actual name of your Destination service instance
+    # Bind the Destination and Connectivity service instances.
+    # Replace the values below with the actual names of your service instances
+    # (BTP Cockpit > Instances and Subscriptions).
+    # The Connectivity service is required for PrincipalPropagation destinations
+    # (on-premise S/4HANA via Cloud Connector).
     services:
       - Hackathon-destination
+      - Hackathon-connectivity   # ← replace with your Connectivity service instance name
 
     env:
       # Name of the destination entry configured in BTP Cockpit > Connectivity > Destinations

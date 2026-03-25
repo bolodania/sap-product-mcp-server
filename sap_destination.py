@@ -6,9 +6,18 @@ Handles:
 2. Retrieving destination details from SAP BTP Destination service
 3. Making authenticated HTTP calls to S/4HANA via the destination
 
+Supported destination authentication types
+------------------------------------------
+- BasicAuthentication          – username/password injected by Destination service
+- OAuth2ClientCredentials      – Bearer token from authTokens in destination response
+- OAuth2SAMLBearerAssertion    – Bearer token from authTokens in destination response
+- PrincipalPropagation         – routes through CF Connectivity on-premise proxy
+                                 (requires Connectivity service bound to the app)
+- NoAuthentication             – no auth header
+
 Credential resolution order
 ---------------------------
-1. VCAP_SERVICES (automatic when the Destination service is bound to the CF app)
+1. VCAP_SERVICES (automatic when services are bound to the CF app)
    Only DESTINATION_NAME still needs to be set as an env var.
 
 2. DESTINATION_SERVICE_* environment variables (local dev / manual override)
@@ -30,21 +39,13 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# VCAP_SERVICES helper
+# VCAP_SERVICES helpers
 # ---------------------------------------------------------------------------
 
-def _read_vcap_destination() -> Optional[Dict[str, Any]]:
+def _read_vcap_service(label: str) -> Optional[Dict[str, Any]]:
     """
     Parse VCAP_SERVICES and return the credentials block of the first
-    bound 'destination' service instance, or None if not present.
-
-    CF injects VCAP_SERVICES automatically when a service is bound.
-    The relevant keys inside credentials are:
-      clientid     – OAuth2 client ID
-      clientsecret – OAuth2 client secret
-      uri          – Destination service REST API base URL
-      url          – XSUAA base URL
-                     (token URL = url + "/oauth/token")
+    bound service instance with the given label, or None if not present.
     """
     vcap_raw = os.getenv("VCAP_SERVICES", "")
     if not vcap_raw:
@@ -55,17 +56,47 @@ def _read_vcap_destination() -> Optional[Dict[str, Any]]:
         logger.warning("VCAP_SERVICES is set but could not be parsed as JSON")
         return None
 
-    # The service label is "destination" in the CF marketplace.
-    for key in ("destination",):
-        instances = vcap.get(key, [])
-        if instances:
-            creds = instances[0].get("credentials", {})
-            if creds.get("clientid") and creds.get("uri"):
-                logger.debug(
-                    "Found Destination service credentials in VCAP_SERVICES[%s]", key
-                )
-                return creds
+    instances = vcap.get(label, [])
+    if instances:
+        creds = instances[0].get("credentials", {})
+        if creds:
+            logger.debug("Found '%s' credentials in VCAP_SERVICES", label)
+            return creds
 
+    return None
+
+
+def _read_vcap_destination() -> Optional[Dict[str, Any]]:
+    """
+    Return credentials for the bound Destination service instance.
+
+    Relevant keys:
+      clientid     – OAuth2 client ID
+      clientsecret – OAuth2 client secret
+      uri          – Destination service REST API base URL
+      url          – XSUAA base URL  (token URL = url + "/oauth/token")
+    """
+    creds = _read_vcap_service("destination")
+    if creds and creds.get("clientid") and creds.get("uri"):
+        return creds
+    return None
+
+
+def _read_vcap_connectivity() -> Optional[Dict[str, Any]]:
+    """
+    Return credentials for the bound Connectivity service instance.
+
+    Relevant keys:
+      clientid               – OAuth2 client ID for proxy token
+      clientsecret           – OAuth2 client secret
+      token_service_url      – XSUAA token URL
+      onpremise_proxy_host   – CF Connectivity proxy hostname
+      onpremise_proxy_port   – CF Connectivity proxy port (HTTPS tunnel)
+      onpremise_proxy_http_port – CF Connectivity proxy port (HTTP tunnel)
+    """
+    creds = _read_vcap_service("connectivity")
+    if creds and creds.get("onpremise_proxy_host"):
+        return creds
     return None
 
 
@@ -100,7 +131,7 @@ class SAPDestinationClient:
 
     Credential resolution order:
 
-    1. VCAP_SERVICES  (automatic when Destination service is bound to the CF app)
+    1. VCAP_SERVICES  (automatic when services are bound to the CF app)
        Only DESTINATION_NAME still needs to be set as an env var.
 
     2. Manual env vars  (local development / CI):
@@ -122,20 +153,20 @@ class SAPDestinationClient:
         self.destination_name = os.getenv("DESTINATION_NAME", "")
 
         # ------------------------------------------------------------------
-        # Priority 1: VCAP_SERVICES (CF bound service)
+        # Priority 1: VCAP_SERVICES (CF bound services)
         # ------------------------------------------------------------------
-        vcap_creds = _read_vcap_destination()
-        if vcap_creds and self.destination_name:
-            # VCAP "url" is the XSUAA base URL; append /oauth/token for the
-            # token endpoint.  Some bindings already include the full path.
-            xsuaa_base = vcap_creds.get("url", "").rstrip("/")
+        vcap_dest = _read_vcap_destination()
+        vcap_conn = _read_vcap_connectivity()
+
+        if vcap_dest and self.destination_name:
+            xsuaa_base = vcap_dest.get("url", "").rstrip("/")
             if not xsuaa_base.endswith("/oauth/token"):
                 xsuaa_base = xsuaa_base + "/oauth/token"
 
             self.dest_auth_url = xsuaa_base
-            self.dest_client_id = vcap_creds.get("clientid", "")
-            self.dest_client_secret = vcap_creds.get("clientsecret", "")
-            self.dest_service_url = vcap_creds.get("uri", "").rstrip("/")
+            self.dest_client_id = vcap_dest.get("clientid", "")
+            self.dest_client_secret = vcap_dest.get("clientsecret", "")
+            self.dest_service_url = vcap_dest.get("uri", "").rstrip("/")
             logger.info(
                 "Destination service credentials loaded from VCAP_SERVICES "
                 "(destination: %s)", self.destination_name
@@ -145,6 +176,7 @@ class SAPDestinationClient:
         # Priority 2: manual DESTINATION_SERVICE_* env vars
         # ------------------------------------------------------------------
         else:
+            vcap_conn = None  # Connectivity proxy only available via VCAP
             self.dest_auth_url = os.getenv("DESTINATION_SERVICE_AUTH_URL", "")
             self.dest_client_id = os.getenv("DESTINATION_SERVICE_CLIENT_ID", "")
             self.dest_client_secret = os.getenv("DESTINATION_SERVICE_CLIENT_SECRET", "")
@@ -156,14 +188,43 @@ class SAPDestinationClient:
                 )
 
         # ------------------------------------------------------------------
+        # Connectivity service (PrincipalPropagation / on-premise proxy)
+        # ------------------------------------------------------------------
+        if vcap_conn:
+            self._conn_token_url = vcap_conn.get("token_service_url", "").rstrip("/")
+            # Some bindings use "url" instead of "token_service_url"
+            if not self._conn_token_url:
+                base = vcap_conn.get("url", "").rstrip("/")
+                self._conn_token_url = base + "/oauth/token" if base else ""
+            self._conn_client_id = vcap_conn.get("clientid", "")
+            self._conn_client_secret = vcap_conn.get("clientsecret", "")
+            self._conn_proxy_host = vcap_conn.get("onpremise_proxy_host", "")
+            # Prefer the HTTP tunnel port; fall back to the generic proxy port
+            self._conn_proxy_port = (
+                vcap_conn.get("onpremise_proxy_http_port")
+                or vcap_conn.get("onpremise_proxy_port", "20003")
+            )
+            logger.info(
+                "Connectivity service loaded from VCAP_SERVICES "
+                "(proxy: %s:%s)", self._conn_proxy_host, self._conn_proxy_port
+            )
+        else:
+            self._conn_token_url = ""
+            self._conn_client_id = ""
+            self._conn_client_secret = ""
+            self._conn_proxy_host = ""
+            self._conn_proxy_port = ""
+
+        # ------------------------------------------------------------------
         # Priority 3: direct S/4HANA connection
         # ------------------------------------------------------------------
         self.s4_base_url = os.getenv("S4_BASE_URL", "")
         self.s4_username = os.getenv("S4_USERNAME", "")
         self.s4_password = os.getenv("S4_PASSWORD", "")
 
-        # Token cache
+        # Token caches
         self._dest_token_cache = TokenCache()
+        self._conn_token_cache = TokenCache()
 
         # Cached destination details
         self._destination_details: Optional[Dict[str, Any]] = None
@@ -221,6 +282,41 @@ class SAPDestinationClient:
         token = data["access_token"]
         expires_in = int(data.get("expires_in", 3600))
         self._dest_token_cache.set(token, expires_in)
+        return token
+
+    def _get_connectivity_proxy_token(self) -> str:
+        """
+        Fetch (or return cached) OAuth2 token for the CF Connectivity proxy.
+
+        This token is sent as Proxy-Authorization when routing requests
+        through the on-premise proxy for PrincipalPropagation destinations.
+        """
+        cached = self._conn_token_cache.get()
+        if cached:
+            return cached
+
+        if not self._conn_token_url:
+            raise RuntimeError(
+                "Connectivity service is not bound to this app. "
+                "Bind the 'connectivity' service instance to use "
+                "PrincipalPropagation destinations."
+            )
+
+        logger.debug("Fetching new Connectivity proxy token from %s", self._conn_token_url)
+        resp = requests.post(
+            self._conn_token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self._conn_client_id,
+                "client_secret": self._conn_client_secret,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data["access_token"]
+        expires_in = int(data.get("expires_in", 3600))
+        self._conn_token_cache.set(token, expires_in)
         return token
 
     # ------------------------------------------------------------------
@@ -282,6 +378,24 @@ class SAPDestinationClient:
                     logger.warning(
                         "No authTokens found in destination response for OAuth2 destination"
                     )
+
+            elif auth_type == "PrincipalPropagation":
+                # Route through the CF Connectivity on-premise proxy.
+                # The proxy handles authentication to the on-premise system.
+                proxy_token = self._get_connectivity_proxy_token()
+                proxy_url = f"http://{self._conn_proxy_host}:{self._conn_proxy_port}"
+                session.proxies = {"http": proxy_url, "https": proxy_url}
+                session.headers["Proxy-Authorization"] = f"Bearer {proxy_token}"
+
+                # If the destination specifies a Cloud Connector location ID, pass it
+                location_id = dest_config.get("CloudConnectorLocationId", "")
+                if location_id:
+                    session.headers["SAP-Connectivity-SCC-Location_ID"] = location_id
+
+                logger.debug(
+                    "PrincipalPropagation: routing via %s (location: %s)",
+                    proxy_url, location_id or "default",
+                )
 
             elif auth_type == "NoAuthentication":
                 pass  # No auth needed

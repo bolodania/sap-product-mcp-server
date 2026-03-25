@@ -245,12 +245,16 @@ mcp_server/
    - **Authentication**: `BasicAuthentication` (or `OAuth2ClientCredentials`)
    - **User** / **Password**: your S/4HANA API user credentials
 
-### 2. Create a Destination Service Instance
+### 2. Create Service Instances
 
+**Destination service** (required for all deployment modes):
 1. Go to **BTP Cockpit** → **Instances and Subscriptions**
 2. Create a **Destination** service instance (plan: `lite`)
-3. Create a **Service Binding** for the instance
-4. Copy the binding credentials into your `.env` file
+
+**Connectivity service** (required for PrincipalPropagation / on-premise S/4HANA via Cloud Connector):
+1. In the same screen, create a **Connectivity** service instance (plan: `lite`)
+
+Both instances will be bound to the CF app via `manifest.yml` — no manual credential setup needed.
 
 ### 3. Ensure API_PRODUCT_SRV is accessible
 
@@ -292,11 +296,16 @@ A `manifest.yml` is included in the project root. Open it and update:
 
 ```yaml
 services:
-  - my-destination-service      # ← your actual instance name
+  - my-destination-service      # ← your Destination service instance name
+  - my-connectivity-service     # ← your Connectivity service instance name (required for PrincipalPropagation)
 
 env:
   DESTINATION_NAME: S4HANA_PRODUCT_SRV   # ← your destination entry name
 ```
+
+> **Note:** The Connectivity service is required when the BTP destination uses
+> **PrincipalPropagation** authentication (on-premise S/4HANA via Cloud Connector).
+> If your destination uses BasicAuthentication or OAuth2, you can omit it.
 
 ### 3. Push the app without starting it
 
