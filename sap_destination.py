@@ -191,11 +191,17 @@ class SAPDestinationClient:
         # Connectivity service (PrincipalPropagation / on-premise proxy)
         # ------------------------------------------------------------------
         if vcap_conn:
-            self._conn_token_url = vcap_conn.get("token_service_url", "").rstrip("/")
-            # Some bindings use "url" instead of "token_service_url"
-            if not self._conn_token_url:
-                base = vcap_conn.get("url", "").rstrip("/")
-                self._conn_token_url = base + "/oauth/token" if base else ""
+            # token_service_url is the full token endpoint URL in most bindings.
+            # Some bindings provide only "url" (XSUAA base) — append /oauth/token.
+            # Either way, ensure the path ends with /oauth/token.
+            raw_token_url = (
+                vcap_conn.get("token_service_url", "")
+                or vcap_conn.get("url", "")
+            ).rstrip("/")
+            if raw_token_url and not raw_token_url.endswith("/oauth/token"):
+                raw_token_url = raw_token_url + "/oauth/token"
+            self._conn_token_url = raw_token_url
+
             self._conn_client_id = vcap_conn.get("clientid", "")
             self._conn_client_secret = vcap_conn.get("clientsecret", "")
             self._conn_proxy_host = vcap_conn.get("onpremise_proxy_host", "")
@@ -206,7 +212,8 @@ class SAPDestinationClient:
             )
             logger.info(
                 "Connectivity service loaded from VCAP_SERVICES "
-                "(proxy: %s:%s)", self._conn_proxy_host, self._conn_proxy_port
+                "(proxy: %s:%s, token_url: %s)",
+                self._conn_proxy_host, self._conn_proxy_port, self._conn_token_url
             )
         else:
             self._conn_token_url = ""
@@ -278,7 +285,14 @@ class SAPDestinationClient:
             timeout=15,
         )
         resp.raise_for_status()
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raw = resp.text[:300] if resp.text else "(empty body)"
+            raise RuntimeError(
+                f"Destination service token endpoint returned non-JSON "
+                f"(HTTP {resp.status_code}): {raw}"
+            ) from exc
         token = data["access_token"]
         expires_in = int(data.get("expires_in", 3600))
         self._dest_token_cache.set(token, expires_in)
@@ -313,7 +327,14 @@ class SAPDestinationClient:
             timeout=15,
         )
         resp.raise_for_status()
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raw = resp.text[:300] if resp.text else "(empty body)"
+            raise RuntimeError(
+                f"Connectivity service token endpoint returned non-JSON "
+                f"(HTTP {resp.status_code}): {raw}"
+            ) from exc
         token = data["access_token"]
         expires_in = int(data.get("expires_in", 3600))
         self._conn_token_cache.set(token, expires_in)
@@ -342,7 +363,14 @@ class SAPDestinationClient:
             timeout=15,
         )
         resp.raise_for_status()
-        details = resp.json()
+        try:
+            details = resp.json()
+        except ValueError as exc:
+            raw = resp.text[:300] if resp.text else "(empty body)"
+            raise RuntimeError(
+                f"Destination service returned non-JSON for destination '{self.destination_name}' "
+                f"(HTTP {resp.status_code}): {raw}"
+            ) from exc
         self._destination_details = details
         self._destination_cached_at = now
         return details
@@ -477,4 +505,12 @@ class SAPDestinationClient:
 
         resp = session.get(url, params=query_params, timeout=30)
         resp.raise_for_status()
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError as exc:
+            # Response was not valid JSON — log the raw body to help diagnose
+            raw = resp.text[:500] if resp.text else "(empty body)"
+            raise RuntimeError(
+                f"S/4HANA returned a non-JSON response (HTTP {resp.status_code}). "
+                f"Raw body: {raw}"
+            ) from exc
