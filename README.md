@@ -247,14 +247,24 @@ mcp_server/
 
 ### 2. Create Service Instances
 
-**Destination service** (required for all deployment modes):
+You can create the instances via the CF CLI or BTP Cockpit.
+
+**Via CF CLI (recommended):**
+
+```bash
+# Destination service — required for all deployment modes
+cf create-service destination lite Hackathon-destination
+
+# Connectivity service — required for PrincipalPropagation (on-premise S/4HANA via Cloud Connector)
+cf create-service connectivity lite Hackathon-connectivity
+```
+
+**Via BTP Cockpit:**
 1. Go to **BTP Cockpit** → **Instances and Subscriptions**
 2. Create a **Destination** service instance (plan: `lite`)
+3. Create a **Connectivity** service instance (plan: `lite`)
 
-**Connectivity service** (required for PrincipalPropagation / on-premise S/4HANA via Cloud Connector):
-1. In the same screen, create a **Connectivity** service instance (plan: `lite`)
-
-Both instances will be bound to the CF app via `manifest.yml` — no manual credential setup needed.
+Both instances are bound to the CF app via `manifest.yml` — no manual credential setup needed.
 
 ### 3. Ensure API_PRODUCT_SRV is accessible
 
