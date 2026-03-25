@@ -403,6 +403,25 @@ class SAPDestinationClient:
             else:
                 logger.warning("Unsupported destination auth type: %s", auth_type)
 
+            # If the destination targets an on-premise system (ProxyType=OnPremise),
+            # route through the CF Connectivity proxy regardless of auth type.
+            # This applies to BasicAuthentication, OAuth2, and NoAuthentication
+            # destinations that point to an internal host via Cloud Connector.
+            # (PrincipalPropagation already sets the proxy above.)
+            proxy_type = dest_config.get("ProxyType", "Internet")
+            if proxy_type == "OnPremise" and auth_type != "PrincipalPropagation":
+                proxy_token = self._get_connectivity_proxy_token()
+                proxy_url = f"http://{self._conn_proxy_host}:{self._conn_proxy_port}"
+                session.proxies = {"http": proxy_url, "https": proxy_url}
+                session.headers["Proxy-Authorization"] = f"Bearer {proxy_token}"
+                location_id = dest_config.get("CloudConnectorLocationId", "")
+                if location_id:
+                    session.headers["SAP-Connectivity-SCC-Location_ID"] = location_id
+                logger.debug(
+                    "OnPremise destination: routing via %s (location: %s)",
+                    proxy_url, location_id or "default",
+                )
+
             # Additional headers from destination (URL.headers.*)
             for key, value in dest_config.items():
                 if key.startswith("URL.headers."):
