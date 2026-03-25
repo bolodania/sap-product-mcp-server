@@ -40,6 +40,8 @@ import threading
 import uuid
 from typing import Any, Dict, Optional
 
+import requests
+
 from flask import Flask, Response, jsonify, request, stream_with_context
 from dotenv import load_dotenv
 
@@ -178,6 +180,15 @@ def _handle_message(sid: str, msg: dict) -> Optional[dict]:
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
 
+        # Log the Authorization header so we can confirm whether Joule forwards
+        # the user's JWT (needed for PrincipalPropagation user identity forwarding)
+        _auth_header = request.headers.get("Authorization", "")
+        if _auth_header:
+            _auth_preview = _auth_header[:40] + "..." if len(_auth_header) > 40 else _auth_header
+            logger.info("tools/call auth header present: %s", _auth_preview)
+        else:
+            logger.info("tools/call auth header: NOT present")
+
         if tool_name not in TOOLS_BY_NAME:
             return _err(req_id, -32602, f"Unknown tool: {tool_name}")
 
@@ -193,12 +204,46 @@ def _handle_message(sid: str, msg: dict) -> Optional[dict]:
                 "isError": False,
             })
         except ValueError as exc:
-            return _err(req_id, -32602, str(exc))
+            # Invalid parameters (e.g. bad $select field) — agent can self-correct
+            return _ok(req_id, {
+                "content": [{"type": "text", "text": f"Parameter error: {exc}"}],
+                "isError": True,
+            })
+        except requests.HTTPError as exc:
+            # HTTP error from S/4HANA (404 not found, 400 bad request, etc.)
+            # Return as a tool-level error so the agent can continue and adapt.
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            if status == 404:
+                msg = f"Not found (404): the requested resource does not exist in S/4HANA. URL: {exc.request.url if exc.request else 'unknown'}"
+            elif status == 400:
+                body = ""
+                try:
+                    body = exc.response.json().get("error", {}).get("message", {}).get("value", "")
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                msg = f"Bad request (400): {body or str(exc)}"
+            elif status == 401:
+                msg = "Unauthorized (401): check the destination credentials and authentication configuration."
+            elif status == 403:
+                msg = "Forbidden (403): the S/4HANA user does not have authorization for this resource."
+            else:
+                msg = f"HTTP {status} error from S/4HANA: {exc}"
+            logger.warning("HTTP %s calling tool %s: %s", status, tool_name, msg)
+            return _ok(req_id, {
+                "content": [{"type": "text", "text": msg}],
+                "isError": True,
+            })
         except RuntimeError as exc:
-            return _err(req_id, -32603, str(exc))
+            return _ok(req_id, {
+                "content": [{"type": "text", "text": f"Server error: {exc}"}],
+                "isError": True,
+            })
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception("Error executing tool %s", tool_name)
-            return _err(req_id, -32603, "Internal error", str(exc))
+            return _ok(req_id, {
+                "content": [{"type": "text", "text": f"Unexpected error: {exc}"}],
+                "isError": True,
+            })
 
     # ---- unknown method ---------------------------------------------------
     if req_id is not None:
