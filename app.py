@@ -180,15 +180,6 @@ def _handle_message(sid: str, msg: dict) -> Optional[dict]:
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
 
-        # Log all incoming headers to find any user identity token Joule may send
-        _interesting = {
-            k: (v[:60] + "..." if len(v) > 60 else v)
-            for k, v in request.headers
-            if k.lower() not in ("host", "content-length", "content-type",
-                                  "accept-encoding", "connection", "user-agent")
-        }
-        logger.info("tools/call incoming headers: %s", _interesting)
-
         if tool_name not in TOOLS_BY_NAME:
             return _err(req_id, -32602, f"Unknown tool: {tool_name}")
 
